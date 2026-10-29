@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.vscode/
+tmp/
+tests/out/
+last_error.log
+*.zip
+SHA256SUMS.txt

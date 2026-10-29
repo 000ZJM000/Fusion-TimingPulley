@@ -16,12 +16,14 @@
 
 import math
 import os
+import csv
 
 import adsk.core
 import adsk.fusion
 
 from . import geometry as G
 from . import profiles as P
+from . import gt as GT
 
 # 输入 id
 ID_PROFILE = 'profile_family'
@@ -38,6 +40,11 @@ ID_CLEAR = 'clearance'
 ID_ODDROP = 'od_drop'
 ID_DEPTH = 'depth_ratio'
 ID_TIP_FILLET = 'tip_fillet'
+ID_GT_SAMPLING = 'gt_sampling_mode'
+ID_GT_SAMPLES = 'gt_samples_per_tooth'
+ID_GT_TOLERANCE = 'gt_tolerance'
+ID_GT_HINT = 'gt_sampling_hint'
+ID_COMPACT_GT = 'compact_gt'
 ID_SKETCH_NAME = 'sketch_name'
 ID_REPLACE = 'replace'
 ID_PITCH_CIRCLE = 'draw_pitch_circle'
@@ -161,7 +168,8 @@ class Dialog(object):
                                          adsk.core.DropDownStyles.TextListDropDownStyle)
         for i, fid in enumerate(fams):
             f = P.family(fid)
-            dd.listItems.add(f['name'], i == 0)
+            label = f['name'] if f['implemented'] else '{0}（未实现）'.format(f['name'])
+            dd.listItems.add(label, i == 0)
         self.el[ID_PROFILE] = dd
         self._families = fams
 
@@ -188,6 +196,12 @@ class Dialog(object):
     def _fill_models(self, dd, fid):
         dd.listItems.clear()
         ids = P.model_ids(fid)
+        f = P.family(fid)
+        if not ids:
+            # 未实现系列：把声明过的型号列出来但不可选
+            dd.listItems.add('（该系列几何求解器待实现）', True)
+            dd.isEnabled = False
+            return
         dd.isEnabled = True
         for i, mid in enumerate(ids):
             dd.listItems.add(mid, i == 0)
@@ -195,10 +209,23 @@ class Dialog(object):
     # -- 齿槽几何 -------------------------------------------------------
 
     def _build_groove(self, inp):
+        sampling = inp.addDropDownCommandInput(
+            ID_GT_SAMPLING, 'GT 采样方式', adsk.core.DropDownStyles.TextListDropDownStyle)
+        sampling.listItems.add('按误差自动采样', True)
+        sampling.listItems.add('指定每齿采样点数', False)
+        self.el[ID_GT_SAMPLING] = sampling
+        self.el[ID_GT_SAMPLES] = inp.addIntegerSpinnerCommandInput(
+            ID_GT_SAMPLES, '每齿采样点数', 9, 513, 2, 33)
+        self.el[ID_GT_TOLERANCE] = inp.addValueInput(
+            ID_GT_TOLERANCE, 'GT 曲线误差上限', 'mm',
+            adsk.core.ValueInput.createByString('0.001 mm'))
+        self.el[ID_GT_HINT] = inp.addTextBoxCommandInput(
+            ID_GT_HINT, '', '点数包含两端和槽底，取奇数。连续曲线模式不会保留采样折角；'
+            '点数越多，对理论轮廓的逼近越精细。', 2, True)
         inp.addTextBoxCommandInput(
             _sid('hint'), '齿槽几何',
-            '轮槽 = 带齿廓形的法向等距偏置。以下参数默认取 HTD 标准值，'
-            '全部可覆盖。', 3, True)
+            'HTD 参数可以覆盖；修改后的齿形属于自定义几何。'
+            '尺寸参考不等于整套标准符合性或啮合认证。', 3, True)
 
         mid = self.current_model()
         p = P.pitch_mm(mid) if mid else 3.0
@@ -208,13 +235,13 @@ class Dialog(object):
             ID_RBT, '槽底圆弧半径系数 r_b/p', '',
             adsk.core.ValueInput.createByReal(spec['rb'] / p))
         inp.addTextBoxCommandInput(
-            _sid('h'), '', 'JB/T 7512.2 标准值：2M 0.265, 3M 0.303, 5M 0.312, 8M 0.321, 14M 0.332, 20M 0.342。', 1, True)
+            _sid('h'), '', '按各节距的独立尺寸表取值；非标节距按 5M 缩放，仅作自定义几何。', 2, True)
 
         self.el[ID_THETA] = inp.addValueInput(
             ID_THETA, '齿槽齿形角 2β（参考值）', 'deg',
             adsk.core.ValueInput.createByString('{0:g} deg'.format(spec.get('beta', 7.0) * 2.0)))
         inp.addTextBoxCommandInput(
-            _sid('h'), '', 'JB/T 7512.2 参考值 ≈14°（由标称槽宽 s、槽深与圆弧相切自动求解，通常保持默认）。', 2, True)
+            _sid('h'), '', '保持默认时按槽宽约束求解；手动角度按输入值执行，无解时拒绝生成。', 2, True)
 
         self.el[ID_CLEAR] = inp.addValueInput(
             ID_CLEAR, '单边间隙系数 c/p', '',
@@ -235,14 +262,14 @@ class Dialog(object):
             adsk.core.ValueInput.createByReal(0.0))
         inp.addTextBoxCommandInput(
             _sid('h'), '',
-            '0 表示由标准国标槽深决定（推荐）。', 1, True)
+            '0 表示采用尺寸表中的槽深。', 1, True)
 
         self.el[ID_TIP_FILLET] = inp.addValueInput(
             ID_TIP_FILLET, '齿顶倒角半径 r_t', 'mm',
             adsk.core.ValueInput.createByString('{0:.2f} mm'.format(spec.get('rt', 0.10 * p))))
         inp.addTextBoxCommandInput(
             _sid('h'), '',
-            '标准推荐值（JB/T 7512.2 表1）：2M 0.15, 3M 0.30, 5M 0.50, 8M 0.80, 14M 1.40, 20M 2.00mm。', 1, True)
+            '以当前尺寸表为初值；无解时不会自动缩小输入的圆角。', 2, True)
 
     # -- 输出选项 -------------------------------------------------------
 
@@ -269,6 +296,11 @@ class Dialog(object):
         inp.addSeparatorCommandInput(_sid('sep'))
         self.el[ID_FALLBACK] = inp.addBoolValueInput(
             ID_FALLBACK, '精确圆弧失败时改用折线近似', True, '', True)
+        self.el[ID_COMPACT_GT] = inp.addBoolValueInput(
+            ID_COMPACT_GT, 'GT 连续光滑曲线（推荐）', True, '', True)
+        inp.addTextBoxCommandInput(
+            _sid('h'), '', '按共轭公式构造光滑样条，避免采样点产生拉伸分面。'
+            '关闭后使用折线；连续曲线失败时停止生成，不自动降级。', 3, True)
 
     # -- 结果与预览 -----------------------------------------------------
 
@@ -339,13 +371,13 @@ class Dialog(object):
         if not pitch_auto:
             pitch_mm = self.el[ID_PITCH].value * 10.0      # cm -> mm
 
-        # 齿侧角: Fusion 内部单位为弧度 (rad)。若值小于 3.2 判定为弧度并转为角度 deg
+        # Fusion 角度输入的数据库单位始终是 rad，不能按数值大小猜单位。
         raw_theta = self.el[ID_THETA].value
         if isinstance(raw_theta, str):
             s = raw_theta.lower().replace('deg', '').replace('度', '').strip()
             theta_deg = float(s)
         else:
-            theta_deg = math.degrees(raw_theta) if abs(raw_theta) < 3.2 else float(raw_theta)
+            theta_deg = math.degrees(float(raw_theta))
 
         # 放置平面与圆心点实体读取
         def _get_selection_entity(inp):
@@ -387,6 +419,12 @@ class Dialog(object):
             'draw_center_line': self.el[ID_CENTER_LINE].value if ID_CENTER_LINE in self.el else False,
             'labels': self.el[ID_LABELS].value,
             'sampled_fallback': self.el[ID_FALLBACK].value,
+            'gt_sampling_mode': ('point_count' if
+                                self.el[ID_GT_SAMPLING].listItems.item(1).isSelected
+                                else 'tolerance'),
+            'gt_samples_per_tooth': int(self.el[ID_GT_SAMPLES].value),
+            'gt_tolerance': self.el[ID_GT_TOLERANCE].value * 10.0,
+            'compact_gt': self.el[ID_COMPACT_GT].value,
         }
 
     # ------------------------------------------------------------------
@@ -402,7 +440,29 @@ class Dialog(object):
             return None, '节距无效（必须大于 0）'
         fid = p['family']
         if not P.is_implemented(fid):
-            return None, '不支持的齿形系列「{0}」'.format(fid)
+            return None, ('齿形系列「{0}」的几何求解器尚未实现。\n'
+                          '当前支持 HTD 名义尺寸模型和小节距 GT 理论共轭轮槽。'
+                          .format((P.family(fid) or {}).get('name', fid)))
+        if fid == 'GT':
+            if pitch != P.pitch_mm(p['model']):
+                return None, 'GT 理论共轭只接受型号对应的原厂节距，不能按比例缩放'
+            fixed_count = p.get('gt_sampling_mode') == 'point_count'
+            key = (p['model'], p['teeth'],
+                   0.001 if fixed_count else p.get('gt_tolerance', 0.001),
+                   p.get('gt_samples_per_tooth', 33) if fixed_count else None)
+            if key != getattr(self, '_gt_cache_key', None):
+                res = GT.solve_groove(*key)
+                self._gt_cache_key, self._gt_cache_result = key, res
+            res = self._gt_cache_result
+            if not res.ok:
+                return None, res.message
+            if p.get('compact_gt', True):
+                try:
+                    GT.prepare_smooth_profile(res)
+                except (ValueError, ArithmeticError) as error:
+                    return None, '连续曲线计算失败：{0}'.format(error)
+            res.target_plane, res.center_point = p.get('target_plane'), p.get('center_point')
+            return res, ''
         try:
             spec = G.get_htd_spec(pitch)
             r_bt_ratio = p['r_bt_ratio']
@@ -412,11 +472,11 @@ class Dialog(object):
             std_rbt = spec['rb'] / pitch
             std_oddrop = spec['u'] * 2.0
             std_theta = spec.get('beta', 7.0) * 2.0
-            if abs(r_bt_ratio - std_rbt) < 5e-3:
+            if abs(r_bt_ratio - std_rbt) < 1e-10:
                 r_bt_ratio = None
-            if abs(od_drop_val - std_oddrop) < 5e-3:
+            if abs(od_drop_val - std_oddrop) < 1e-10:
                 od_drop_val = None
-            if abs(flank_angle_deg - std_theta) < 0.1:
+            if abs(flank_angle_deg - std_theta) < 1e-8:
                 flank_angle_deg = None
 
             res = G.solve_groove(
@@ -425,7 +485,7 @@ class Dialog(object):
                 r_bt_ratio=r_bt_ratio,
                 flank_angle_deg=flank_angle_deg,
                 od_drop=od_drop_val,
-                depth_ratio=p.get('depth_ratio'),
+                depth_ratio=None if p.get('depth_ratio') == 0 else p.get('depth_ratio'),
                 tip_fillet=p.get('tip_fillet'))
         except Exception as err:
             return None, '几何求解异常：{0}'.format(err)
@@ -434,7 +494,6 @@ class Dialog(object):
         if res is not None:
             res.target_plane = p.get('target_plane')
             res.center_point = p.get('center_point')
-            res.tip_fillet = p.get('tip_fillet')
         return res, ''
 
     # ------------------------------------------------------------------
@@ -454,9 +513,26 @@ class Dialog(object):
 
     def _refresh_enabled(self):
         fid = self.current_family()
+        if fid != getattr(self, '_last_family', None):
+            self._fill_models(self.el[ID_MODEL], fid)
+            self._last_family = fid
         implemented = P.is_implemented(fid)
         self.el[ID_MODEL].isEnabled = implemented and bool(P.model_ids(fid))
 
+        gt_mode = fid == 'GT'
+        fixed_count = self.el[ID_GT_SAMPLING].listItems.item(1).isSelected
+        for input_id in (ID_GT_SAMPLING, ID_GT_SAMPLES, ID_GT_TOLERANCE, ID_GT_HINT):
+            self.el[input_id].isVisible = gt_mode
+        self.el[ID_GT_SAMPLING].isEnabled = gt_mode
+        self.el[ID_GT_SAMPLES].isEnabled = gt_mode and fixed_count
+        self.el[ID_GT_TOLERANCE].isEnabled = gt_mode and not fixed_count
+        self.el[ID_COMPACT_GT].isEnabled = gt_mode
+        self.el[ID_FALLBACK].isEnabled = not (gt_mode and self.el[ID_COMPACT_GT].value)
+        self.el[ID_PITCH_AUTO].isEnabled = not gt_mode
+        if gt_mode:
+            self.el[ID_PITCH_AUTO].value = True
+        for input_id in (ID_RBT, ID_THETA, ID_CLEAR, ID_ODDROP, ID_DEPTH, ID_TIP_FILLET):
+            self.el[input_id].isEnabled = implemented and not gt_mode
         pitch_auto = self.el[ID_PITCH_AUTO].value
         self.el[ID_PITCH].isEnabled = not pitch_auto
         if pitch_auto:
@@ -481,21 +557,22 @@ class Dialog(object):
                 self.el[ID_TEETH].value = zmax
 
         # 型号切换联动：自动刷新为当前型号的国标标准推荐值
-        if mid != getattr(self, '_last_model_mid', None):
-            p = P.pitch_mm(mid) if mid else None
+        if (fid, mid, self.el[ID_PITCH].value) != getattr(self, '_last_spec_key', None):
+            p = P.pitch_mm(mid) if pitch_auto and mid else self.el[ID_PITCH].value * 10.0
             if not p:
                 try:
                     p = self.el[ID_PITCH].value * 10.0
                 except Exception:
                     p = 3.0
-            if p and p > 0:
+            if p and p > 0 and not gt_mode:
                 spec = G.get_htd_spec(p)
-                _set_value_input(self.el[ID_TIP_FILLET], '{0:.2f} mm'.format(spec.get('rt', 0.10 * p)), spec.get('rt', 0.10 * p) / 10.0)
-                _set_value_input(self.el[ID_RBT], '{0:.4f}'.format(spec.get('rb', 0.312 * p) / p), spec.get('rb', 0.312 * p) / p)
-                _set_value_input(self.el[ID_ODDROP], '{0:.4f}'.format(spec.get('u', 0.1144 * p) * 2.0 / p), spec.get('u', 0.1144 * p) * 2.0 / p)
+                _set_value_input(self.el[ID_TIP_FILLET], '{0:.12g} mm'.format(spec['rt']), spec['rt'] / 10.0)
+                _set_value_input(self.el[ID_RBT], '{0:.12g}'.format(spec['rb'] / p), spec['rb'] / p)
+                _set_value_input(self.el[ID_ODDROP], '{0:.12g}'.format(spec['u'] * 2.0 / p), spec['u'] * 2.0 / p)
                 theta_deg = spec.get('beta', 7.0) * 2.0
                 _set_value_input(self.el[ID_THETA], '{0:g} deg'.format(theta_deg), math.radians(theta_deg))
             self._last_model_mid = mid
+            self._last_spec_key = (fid, mid, self.el[ID_PITCH].value)
 
     def _refresh_text(self):
         res, err = self.solve()
@@ -506,6 +583,20 @@ class Dialog(object):
             self.el[ID_SUMMARY].text = '无法求解：\n{0}'.format(err)
             self.el[ID_STATS].text = ''
             self.el[ID_WARN].text = ''
+            return
+
+        if self.current_family() == 'GT':
+            smooth = bool(res.smooth_curves) and self.el[ID_COMPACT_GT].value
+            self.el[ID_SUMMARY].text = '\n'.join(
+                '{0} = {1} {2}'.format(*row) for row in _gt_rows(res, self.read())[:10])
+            self.el[ID_STATS].text = (
+                '理论共轭轮槽；无加工间隙，不等同原厂制造槽形\n'
+                '每齿 {0} 个插值点；曲线误差上界 {1:g} mm\n'
+                '预计写入 {2} 条草图曲线'.format(
+                    res.smooth_samples_per_tooth if smooth else res.samples_per_tooth,
+                    res.smooth_error_bound if smooth else res.approximation_tolerance,
+                    (2 * len(res.smooth_curves) + 1) * res.teeth if smooth else len(G.closed_chain(res))))
+            self.el[ID_WARN].text = '\n'.join(res.warnings)
             return
 
         fit = G.belt_fit(res)
@@ -527,10 +618,10 @@ class Dialog(object):
         ]
         self.el[ID_SUMMARY].text = '\n'.join(lines)
 
-        per_t = 7 if (res.r_tip is not None and res.r_tip > 1e-9) else 5
+        per_t = len(G.closed_chain(res)) // res.teeth
         self.el[ID_STATS].text = (
-            '啮合校核：齿顶间隙 {0:.5f} mm（设定 {1:.5f} mm）\n'
-            '标准符合：JB/T 7512.2 / ISO 13050 直线齿侧平滑相切\n'
+            '尺寸参考：齿顶径向间隙 {0:.5f} mm（额外余量 {1:.5f} mm）\n'
+            '未作整套标准符合性及动态啮合校核\n'
             '轮廓段数 = {2} （= {3} × 齿数）'.format(
                 fit['tip_gap'], res.clearance,
                 per_t * res.teeth, per_t))
@@ -548,6 +639,9 @@ class Dialog(object):
 
     def validate(self):
         """返回 (ok, message)。包含严谨的数值范围防呆拦截。"""
+        for inp in self.el.values():
+            if getattr(inp, 'isEnabled', True) and not getattr(inp, 'isValidExpression', True):
+                return False, '参数表达式无效：{0}'.format(inp.name)
         p = self.read()
         if not p['sketch_name'] or not p['sketch_name'].strip():
             return False, '草图名称不能为空'
@@ -563,6 +657,10 @@ class Dialog(object):
             return False, '齿数必须至少为 3 齿'
         if teeth > 1000:
             return False, '齿数过大（已超过 1000 齿）'
+
+        if p['family'] == 'GT':
+            res, err = self.solve(p)
+            return res is not None, err
 
         clearance = p.get('clearance_ratio', 0.0)
         if clearance < 0:
@@ -601,6 +699,13 @@ class Dialog(object):
 
 def summary_text(result, opts, messages):
     """生成可粘贴的生成摘要（也用作设计属性）。"""
+    if getattr(result, 'profile_chain', None) is not None:
+        lines = ['同步带轮生成器 — 生成摘要']
+        lines.extend('{0}: {1} {2}'.format(*row) for row in _gt_rows(result, opts))
+        lines.append('参数清单')
+        lines.extend('  {0} = {1}'.format(k, opts[k]) for k in sorted(opts))
+        lines.extend(str(m) for m in messages)
+        return '\n'.join(lines)
     fit = G.belt_fit(result)
     lines = []
     lines.append('同步带轮生成器 — 生成摘要')
@@ -626,9 +731,12 @@ def summary_text(result, opts, messages):
     lines.append('-' * 46)
     lines.append('单边间隙    : {0:.4f} mm'.format(result.clearance))
     lines.append('齿顶间隙    : {0:.5f} mm'.format(fit['tip_gap']))
-    lines.append('偏置复核    : 槽底+{0:.5f} 齿侧圆心{1:.5f} 齿侧半径+{2:.5f}'
+    lines.append('尺寸比较    : 槽底+{0:.5f} 圆心位移{1:.5f} 齿侧半径+{2:.5f}'
                  .format(fit['bottom_excess'], fit['center_shift'],
                          fit['flank_radius_excess']))
+    lines.append('校核范围    : 名义尺寸比较，不含完整齿廓干涉或动态啮合')
+    for warning in result.warnings:
+        lines.append('提示        : ' + warning)
     lines.append('-' * 46)
     lines.append('参数清单')
     for k in sorted(opts.keys()):
@@ -643,6 +751,8 @@ def summary_text(result, opts, messages):
 
 def param_rows(result, opts):
     """返回参数表（供 CSV/表格导出）。"""
+    if getattr(result, 'profile_chain', None) is not None:
+        return _gt_rows(result, opts)
     fit = G.belt_fit(result)
     rows = [
         ('齿形系列', opts.get('family', ''), ''),
@@ -663,21 +773,49 @@ def param_rows(result, opts):
             result.flank_arc.radius if result.flank_arc else 0.0), 'mm'),
         ('单边间隙', '{0:.6f}'.format(result.clearance), 'mm'),
         ('齿顶间隙', '{0:.6f}'.format(fit['tip_gap']), 'mm'),
-        ('槽底圆弧超出量', '{0:.6f}'.format(fit['bottom_excess']), 'mm'),
-        ('齿侧圆心偏移量', '{0:.6f}'.format(fit['center_shift']), 'mm'),
+        ('槽底圆弧半径差', '{0:.6f}'.format(fit['bottom_excess']), 'mm'),
+        ('槽底圆心偏移量', '{0:.6f}'.format(fit['center_shift']), 'mm'),
         ('齿侧圆弧超出量', '{0:.6f}'.format(fit['flank_radius_excess']), 'mm'),
         ('齿侧角', '{0:.4f}'.format(result.theta_deg), 'deg'),
-        ('齿顶倒角半径', '{0:.6f}'.format(getattr(result, 'tip_fillet', None) or result.r_bf), 'mm'),
+        ('齿顶倒角半径', '{0:.6f}'.format(result.r_tip), 'mm'),
         ('外径收缩系数', '{0:.6f}'.format(result.od_drop / result.pitch), ''),
         ('齿顶圆弧系数', '{0:.6f}'.format(result.r_bt_ratio), ''),
+        ('校核范围', '仅名义尺寸比较，未作完整啮合校核', ''),
     ]
     return rows
+
+
+def _gt_rows(result, opts):
+    """GT 只报告实际计算量，不套用 HTD 带齿/圆弧校核指标。"""
+    smooth = bool(result.smooth_curves) and opts.get('compact_gt', True)
+    return [
+        ('齿形系列', 'GT 理论共轭', ''),
+        ('型号', opts.get('model', ''), ''),
+        ('节距', '{0:.6f}'.format(result.pitch), 'mm'),
+        ('齿数', str(result.teeth), ''),
+        ('节圆直径', '{0:.6f}'.format(result.pitch_diameter), 'mm'),
+        ('外圆直径', '{0:.6f}'.format(result.outer_diameter), 'mm'),
+        ('齿根圆直径', '{0:.6f}'.format(result.root_diameter), 'mm'),
+        ('槽深', '{0:.6f}'.format(result.groove_depth), 'mm'),
+        ('齿顶外圆弧长', '{0:.6f}'.format(result.tip_width), 'mm'),
+        ('节线差', '{0:.6f}'.format(result.od_drop / 2.0), 'mm'),
+        ('加工间隙', '0（理论模型）', 'mm'),
+        ('采样方式', '指定点数' if result.sampling_mode == 'point_count' else '按误差自动', ''),
+        ('曲线类型', 'C2 连续三次 NURBS' if smooth else '采样折线', ''),
+        ('每齿插值点数', result.smooth_samples_per_tooth if smooth else result.samples_per_tooth, ''),
+        ('曲线误差上界', '{0:.9f}'.format(
+            result.smooth_error_bound if smooth else result.approximation_tolerance), 'mm'),
+        ('采样折线及外圆段数', len(G.closed_chain(result)), ''),
+        ('计算方法', str(result.standard_note), ''),
+        ('资料来源', str(result.source), ''),
+        ('适用限制', '理论共轭；未包含原厂制造公差或动态变形补偿', ''),
+    ]
 
 
 def write_csv(path, rows):
     """导出参数表为 CSV（UTF-8 BOM，便于 Excel 打开）。"""
     with open(path, 'w', encoding='utf-8-sig', newline='') as fh:
-        fh.write('参数,数值,单位\n')
-        for name, value, unit in rows:
-            fh.write('{0},{1},{2}\n'.format(name, value, unit))
+        writer = csv.writer(fh)
+        writer.writerow(('参数', '数值', '单位'))
+        writer.writerows(rows)
     return path

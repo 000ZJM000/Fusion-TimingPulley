@@ -346,6 +346,9 @@ def scan_sensitivity():
     print('-' * 55)
     for c in (0.0, 0.05, 0.1, 0.2, 0.3):
         res = G.solve_groove(5.0, 20, clearance=c)
+        if c == 0.3:
+            check('间隙 0.3 不允许靠缩小圆角伪造可解结果', not res.ok, res.message)
+            continue
         if not res.ok:
             check('间隙 {0} 可解'.format(c), False, res.message)
             continue

@@ -1,49 +1,12 @@
 # -*- coding: utf-8 -*-
-"""
-几何求解引擎（纯 Python，不依赖 Fusion API）
-==========================================
+"""纯 Python 几何工具和历史 HTD 名义尺寸模型，长度 mm、角度 deg。
 
-标准 HTD 齿形几何模型（ISO 13050 / JB/T 7512.2）
-------------------------------------------------
+HTD 的构造为槽底圆弧、相切直线侧壁、与外圆相切的齿顶圆角。
+约束：Rp=p*z/(2*pi)，Ro=Rp-u，槽底最低点 Ro-hg；由槽口半宽
+解侧壁倾角，或采用显式输入角度。各输入不满足约束时返回失败。
 
-高扭矩圆弧齿同步带轮（HTD Pulley）齿槽标准几何由以下参数确定：
-
-    1. 节圆半径 R_pitch = pitch * z / (2 * pi)
-    2. 节线差 / 外径收缩量 u（或直径方向 od_drop = 2u）
-       带轮外圆半径 R_out = R_pitch - u
-    3. 齿槽深度 h_g
-       齿根圆半径（槽底最低点半径） R_root = R_out - h_g
-    4. 槽底圆弧半径 r_b
-       槽底圆心 C_b = (0, R_out - h_g + r_b)
-    5. 槽口宽度 s（或外圆上槽口半宽 x_e = s / 2）
-       右槽口出点 P_exit_r = (x_e, sqrt(R_out^2 - x_e^2))
-    6. 齿侧过渡圆弧半径 r_f
-       齿侧圆心 C_f = (x_f, y_f) 由两相切/交点几何约束解析求得：
-           ||C_f - P_exit_r|| = r_f
-           ||C_f - C_b||      = r_b + r_f
-       联立两圆方程，取纵坐标较小解（向内凹入槽心一侧），即求得精确齿侧圆心。
-    7. 槽底与齿侧切点 T_r：
-           T_r = C_b + (r_b / (r_b + r_f)) * (C_f - C_b)
-       在 T_r 处槽底圆弧与齿侧过渡圆弧一阶光滑相切（法线严格共线）。
-    8. 齿顶倒角圆弧半径 r_t（Tooth Tip Fillet）：
-       在齿侧过渡圆弧 (C_f, r_f) 与带轮外圆 (0, R_out) 之间引入倒角圆角 r_t。
-       双圆相切解析求交：
-           ||C_t - (0,0)|| = R_out - r_t
-           ||C_t - C_f||   = r_f - r_t (因为 C_t 在齿侧圆弧内部/齿材侧)
-       联立求解得倒角圆心 C_t，切点 P_tip_out = C_t * R_out / (R_out - r_t)，
-       切点 P_tip_flank = C_f + (r_f / (r_f - r_t)) * (C_t - C_f)。
-
-完整单个齿距包含 7 段严格相切/光滑连接的图元（逆时针顺序）：
-    1. 右齿侧斜线：从 P_line_r 到 P_bot_r
-    2. 右槽底圆弧：从 P_bot_r 顺时针到中心最低点 (0, R_out - h_g)
-    3. 左槽底圆弧：从中心最低点 (0, R_out - h_g) 顺时针到 P_bot_l
-    4. 左齿侧斜线：从 P_bot_l 到 P_line_l
-    5. 左齿顶倒角弧：从 P_line_l 到 P_out_l（圆心 C_tl，半径 r_t，逆时针）
-    6. 齿顶外圆弧：沿外圆 R_out 从 P_out_l 逆时针到下一槽右倒角切点 P_out_r,next
-    7. 右齿顶倒角弧：从 P_out_r,next 到下一槽右侧线切点 P_line_r,next（圆心 C_tr,next，半径 r_t，逆时针）
-（若 r_t == 0 则退化为 5 段相切模型；槽底中心最低点形成独立草图顶点，可精准标注尺寸）
-
-单位：内部一律 mm，角度对外用 度。Fusion 内部单位为 cm，见 sketch.py。
+本模型不等同于 ISO 13050 完整 H 系统，也不证明完整带齿啮合。
+GT 的原厂带齿及理论滚动共轭计算见 gt.py，不能调用此 HTD 模型代替。
 """
 
 import concurrent.futures
@@ -53,14 +16,8 @@ import os
 _TOL = 1e-12
 
 # ---------------------------------------------------------------------------
-# 标准 HTD 规格数据（ISO 13050 / JB/T 7512.2，单位 mm）
-# 齿顶圆角半径 rt 严格依据 JB/T 7512.2 表 1 标准公称推荐值：
-#   2M:  0.20 mm (按 0.10*p 比例)
-#   3M:  0.30 mm (标准范围 0.26 ~ 0.35 mm)
-#   5M:  0.50 mm (标准范围 0.48 ~ 0.52 mm)
-#   8M:  0.80 mm (标准范围 0.78 ~ 0.84 mm)
-#   14M: 1.40 mm (标准范围 1.36 ~ 1.50 mm)
-#   20M: 2.00 mm (标准范围 1.95 ~ 2.25 mm)
+# 历史 HTD 名义尺寸表（mm）；3M~20M 部分尺寸参考 JB/T 7512.2-1994。
+# 2M 为原有工程参考值。槽底/侧壁构造不声称符合整套制造标准。
 # ---------------------------------------------------------------------------
 
 HTD_SPECS = {
@@ -101,11 +58,16 @@ _SAMPLES = 192
 
 
 def get_htd_spec(pitch):
-    """根据节距匹配标准 HTD 规格；非标节距按比例缩放。"""
+    """查询历史 HTD 尺寸；非标节距仅为 5M 尺寸的工程缩放。
+
+    3M~20M 的名义尺寸可对照 JB/T 7512.2-1994 表 1；2M 与任意节距
+    均不在该表范围。此表不能代替 ISO 13050:2022 按齿数分档的 H 齿廓。
+    """
     for std_p, sp in HTD_SPECS.items():
         if abs(pitch - std_p) < 1e-4:
             return dict(sp)
-    return {k: v * pitch for k, v in HTD_RATIOS.items()}
+    return {k: (v if k == 'beta' else v * pitch)
+            for k, v in HTD_RATIOS.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +239,7 @@ class Line(object):
 
 
 # ---------------------------------------------------------------------------
-# 带齿廓形（ISO 13050 标准带齿参考）
+# 历史带齿参考尺寸及示意采样（不参与制造齿形认证）
 # ---------------------------------------------------------------------------
 
 def solve_belt_tooth(pitch, r_bt_ratio=None, flank_angle_deg=None):
@@ -422,13 +384,13 @@ def solve_beta_for_groove(Ro, hg, rb, rt, half_s):
     - 槽底最低点仅下沉到 Ro - hg，绝对不与齿根圆形成多余相切约束
     """
     Cby = (Ro - hg) + rb
-    if rt <= 1e-6:
+    if rt == 0.0:
         y_sharp = math.sqrt(max(0.0, Ro * Ro - half_s * half_s))
         A = half_s
         B = -(y_sharp - Cby)
         R_AB = math.hypot(A, B)
         if R_AB < rb:
-            return math.radians(7.0)
+            raise ValueError('槽口宽、槽深与槽底半径不允许相切侧壁')
         phi = math.atan2(B, A)
         arg = max(-1.0, min(1.0, rb / R_AB))
         return phi + math.acos(arg)
@@ -446,12 +408,16 @@ def solve_beta_for_groove(Ro, hg, rb, rt, half_s):
         px = xct - rt * cos_b
         return px - half_s
 
-    low = 0.0001
-    high = math.radians(65.0)
+    low = 0.0
+    high = math.pi / 2.0 - 1e-9
     f_low = f(low)
     f_high = f(high)
+    if abs(f_low) < 1e-12:
+        return low
+    if abs(f_high) < 1e-12:
+        return high
     if f_low * f_high > 0:
-        return math.radians(7.0)
+        raise ValueError('无法在有效角度范围内满足槽宽与相切约束')
     for _ in range(50):
         mid = (low + high) * 0.5
         f_mid = f(mid)
@@ -467,7 +433,7 @@ def solve_beta_for_groove(Ro, hg, rb, rt, half_s):
 
 
 def groove_arcs(result):
-    """计算单个齿槽的标准轮廓（严格双圆外公切线连续相切模型）：
+    """计算单个齿槽的尺寸约束轮廓（严格双圆外公切线连续相切模型）：
     - 槽深 hg：带轮外圆顶点 (0, Ro) 到槽底最低点 (0, ybot) 距离严格为 hg，最低点 ybot = Ro - hg
     - 槽底圆弧：半径 rb，圆心 Cb = (0, ybot + rb)
     - 齿侧斜线：法向量与 Y 轴夹角为 β，与槽底圆弧严格相切于 P_bot_r / P_bot_l
@@ -494,12 +460,14 @@ def groove_arcs(result):
     explicit_theta = getattr(result, 'theta_deg', None)
     if (not is_auto) and explicit_theta is not None:
         beta = math.radians(explicit_theta / 2.0)
-    elif half_s is not None and half_s > rb:
+    elif half_s is not None:
         beta = solve_beta_for_groove(Ro, hg, rb, rt, half_s)
         result.theta_deg = math.degrees(beta) * 2.0
     else:
-        beta_deg = (explicit_theta if explicit_theta is not None else 14.0) / 2.0
-        beta = math.radians(beta_deg)
+        raise ValueError('缺少可用于求解齿侧角的槽口宽度')
+
+    if not 0.0 < beta < math.pi / 2.0:
+        raise ValueError('相切约束要求齿侧半角在 0° 与 90° 之间')
 
     ybot = Ro - hg
     P_bot = (0.0, ybot)
@@ -519,7 +487,7 @@ def groove_arcs(result):
     arc_bottom = Arc(center=Cb, radius=rb, start=P_bot_r, end=P_bot_l, mid=P_bot,
                      start_ang=ang_b_s, end_ang=ang_b_e, is_ccw=False, name='槽底弧')
 
-    # 按标准将槽底圆弧关于中心对称轴分为对称的左右两段圆弧（汇交于槽底中心最低点 P_bot，生成标准草图顶点与非单段连续底弧）
+    # 将槽底圆弧关于中心对称轴分为左右两段，方便标注（汇交于槽底中心最低点 P_bot，生成标准草图顶点与非单段连续底弧）
     # 右槽底弧：从 P_bot_r 到 P_bot（顺时针 CW，角度从 -beta 到 -pi/2）
     ang_s_r = -beta
     ang_e_r = -math.pi / 2.0
@@ -548,20 +516,17 @@ def groove_arcs(result):
     P_sharp_l = (-x_sharp, y_sharp)
 
     # 齿顶倒角与外圆、齿侧斜线双相切解析求解
-    if rt > 1e-9:
-        rt_used = rt
-        for _ in range(20):
-            R_ctr = Ro - rt_used
-            K = rb + rt_used - Cby * sin_b
-            if R_ctr * R_ctr >= K * K + 1e-9:
-                v = math.sqrt(R_ctr * R_ctr - K * K)
-                if v > Cby * cos_b + 1e-4:
-                    break
-            rt_used *= 0.85
-        else:
-            rt_used = 0.0
+    rt_used = rt
+    if rt > 0.0:
+        R_ctr = Ro - rt
+        K = rb + rt - Cby * sin_b
+        disc = R_ctr * R_ctr - K * K
+        if R_ctr <= 0 or disc <= 0:
+            raise ValueError('指定倒角半径无法满足外圆与齿侧的相切约束')
+        if math.sqrt(disc) <= Cby * cos_b + 1e-9:
+            raise ValueError('指定倒角半径使齿侧线段消失；请减小倒角或调整齿槽尺寸')
 
-    if rt > 1e-9 and rt_used > 1e-6:
+    if rt > 0.0:
         R_ctr = Ro - rt_used
         K = rb + rt_used - Cby * sin_b
         v = math.sqrt(max(0.0, R_ctr * R_ctr - K * K))
@@ -610,6 +575,10 @@ def groove_arcs(result):
 
     line_right = Line(start=P_line_r, end=P_bot_r, name='右齿侧线')
     line_left = Line(start=P_bot_l, end=P_line_l, name='左齿侧线')
+    side_length = ((P_line_r[0] - P_bot_r[0]) * sin_b +
+                   (P_line_r[1] - P_bot_r[1]) * cos_b)
+    if side_length <= 1e-9:
+        raise ValueError('齿侧相切线段长度必须大于零')
 
     # pts 统一导出关键几何点与倒角圆弧
     pts = (P_out_r, P_out_l, P_bot_r, P_bot_l,
@@ -628,20 +597,54 @@ def groove_arcs(result):
 def solve_groove(pitch, teeth, clearance=None, r_bt_ratio=None,
                  flank_angle_deg=None, od_drop=None, samples=None,
                  depth_ratio=None, tip_fillet=None, r_tip=None):
-    """求解标准 HTD 带轮轮槽几何。返回 GrooveResult。"""
-    warnings = []
+    """求解历史 HTD 尺寸约束模型；返回结果不表示 ISO 齿廓合格。"""
+    warnings = ['历史 HTD 模型仅满足名义尺寸及解析相切约束，未实现 ISO 13050 完整齿廓与公差。']
 
     # 输入校验
-    if pitch is None or not (pitch > 0):
-        return GrooveResult(ok=False, message='节距必须大于 0')
     try:
-        z = int(teeth)
-    except (TypeError, ValueError):
-        return GrooveResult(ok=False, message='齿数必须是整数')
-    if abs(float(teeth) - z) > 1e-9:
+        if isinstance(pitch, bool) or isinstance(teeth, bool):
+            raise ValueError()
+        pitch = float(pitch)
+        teeth_value = float(teeth)
+        if not math.isfinite(pitch) or not math.isfinite(teeth_value):
+            raise ValueError()
+        z = int(teeth_value)
+    except (TypeError, ValueError, OverflowError):
+        return GrooveResult(ok=False, message='节距和齿数必须是有限数值，齿数必须为整数')
+    if pitch <= 0:
+        return GrooveResult(ok=False, message='节距必须大于 0')
+    if teeth_value != z:
         return GrooveResult(ok=False, message='齿数必须是整数')
     if z < 3:
         return GrooveResult(ok=False, message='齿数必须 >= 3')
+
+    values = {'间隙': clearance, '槽底半径系数': r_bt_ratio,
+              '齿形角': flank_angle_deg, '外径收缩量': od_drop,
+              '槽深系数': depth_ratio, '倒角半径': tip_fillet,
+              '齿顶倒角半径': r_tip, '采样数': samples}
+    for label, value in values.items():
+        if value is not None:
+            try:
+                finite = math.isfinite(value)
+            except (TypeError, ValueError, OverflowError):
+                finite = False
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not finite:
+                return GrooveResult(ok=False, message=label + '必须为有限数值')
+    if r_bt_ratio is not None and r_bt_ratio <= 0:
+        return GrooveResult(ok=False, message='槽底半径系数必须大于零')
+    if depth_ratio is not None and depth_ratio <= 0:
+        return GrooveResult(ok=False, message='槽深系数必须大于零')
+    if flank_angle_deg is not None and not 0 < flank_angle_deg < 180:
+        return GrooveResult(ok=False, message='齿形角必须大于 0° 且小于 180°')
+    if samples is not None and (int(samples) != samples or samples < 3):
+        return GrooveResult(ok=False, message='采样数必须为不小于 3 的整数')
+    if samples is not None:
+        samples = int(samples)
+    if r_tip is not None and tip_fillet is not None and r_tip != tip_fillet:
+        return GrooveResult(ok=False, message='r_tip 与 tip_fillet 不能指定不同的倒角半径')
+
+    if pitch not in (3.0, 5.0, 8.0, 14.0, 20.0):
+        warnings.append('该节距不在 JB/T 7512.2-1994 表 1 范围内，仅为工程参考。')
 
     spec = get_htd_spec(pitch)
 
@@ -663,6 +666,9 @@ def solve_groove(pitch, teeth, clearance=None, r_bt_ratio=None,
     pitch_radius = pitch * z / (2.0 * math.pi)
     pitch_angle = 2.0 * math.pi / z
     outer_radius = pitch_radius - u
+
+    if not math.isfinite(outer_radius):
+        return GrooveResult(ok=False, message='输入尺寸超出有限浮点计算范围')
 
     if outer_radius <= 0:
         return GrooveResult(
@@ -701,10 +707,6 @@ def solve_groove(pitch, teeth, clearance=None, r_bt_ratio=None,
         return GrooveResult(
             ok=False,
             message='齿顶倒角半径必须小于带轮外圆半径')
-    if rt > 0 and rt >= rf:
-        return GrooveResult(
-            ok=False,
-            message='齿顶倒角半径 ({0:.4f} mm) 不能大于等于齿侧过渡公称参考值 rf ({1:.4f} mm)'.format(rt, rf))
 
     s = spec['s'] + 2.0 * c
     xe = s / 2.0
@@ -762,7 +764,7 @@ def solve_groove(pitch, teeth, clearance=None, r_bt_ratio=None,
         hb=hg,
         h_pd=belt['h_pd'],
         belt_half_width=belt['half_width'],
-        belt_tip_lowest=pitch_radius - spec['hb'],
+        belt_tip_lowest=outer_radius - spec['hb'],
         groove_lowest=groove_lowest,
         groove_depth=hg,
         groove_half_width=xe,
@@ -772,12 +774,8 @@ def solve_groove(pitch, teeth, clearance=None, r_bt_ratio=None,
     )
 
     try:
-        current_rt = getattr(res, 'r_tip', None)
-        if current_rt is None:
-            current_rt = getattr(res, 'tip_fillet', 0.0) or 0.0
-        current_rt = float(current_rt)
-
-        for attempt in range(10):
+        # 求解一次并严格保留指定尺寸；不可通过缩小倒角掩盖不可行输入。
+        for attempt in range(1):
             bottom_arc, line_right, line_left, pts = groove_arcs(res)
             res.bottom_arc = bottom_arc
             res.line_right = line_right
@@ -804,12 +802,7 @@ def solve_groove(pitch, teeth, clearance=None, r_bt_ratio=None,
                 ang_out_r = math.atan2(res.tip_out_right[0], res.tip_out_right[1])
                 sw_tip = pitch_angle - 2.0 * ang_out_r
                 res.tip_width = outer_radius * sw_tip
-                if res.tip_width <= 1e-4 and current_rt > 1e-4:
-                    current_rt *= 0.8
-                    res.r_tip = current_rt
-                    res.tip_fillet = current_rt
-                    continue
-                elif res.tip_width <= 0:
+                if res.tip_width <= 1e-9:
                     return GrooveResult(
                         ok=False,
                         message='齿顶倒角过大导致齿顶外圆宽度为负：请减小倒角半径或增大齿数')
@@ -900,6 +893,9 @@ def closed_chain(result):
     """
     if not result.ok:
         raise ValueError('轮槽求解失败：{0}'.format(result.message))
+
+    if getattr(result, 'profile_chain', None) is not None:
+        return list(result.profile_chain)
 
     z = int(result.teeth)
     pitch_ang = result.pitch_angle
@@ -1047,7 +1043,7 @@ def polygon_area(pts):
 
 
 def belt_fit(result, samples=None):
-    """校核带齿与轮槽的装配配合指标。"""
+    """仅比较名义槽深与带齿高；不构成全齿廓干涉/啮合校核。"""
     spec = get_htd_spec(result.pitch)
     hb_belt = spec['hb']
     r_bt_belt = spec['r_bt']
@@ -1055,7 +1051,10 @@ def belt_fit(result, samples=None):
 
     tip_gap = result.groove_depth - hb_belt
     bottom_excess = result.bottom_arc.radius - r_bt_belt
-    center_shift = result.clearance
+    # 历史模型的槽底圆心始终是 (0, Ro-hg+rb)，额外间隙同时加到 hg/rb，
+    # 因此不能把输入 clearance 冒充圆心位移测量。
+    nominal_bottom_y = result.outer_radius - spec['hg'] + spec['rb']
+    center_shift = _len(_sub(result.bottom_arc.center, (0.0, nominal_bottom_y)))
     flank_radius_excess = (result.flank_arc.radius - r_bf_belt) if result.flank_arc is not None else 0.0
 
     warnings = []
@@ -1072,6 +1071,8 @@ def belt_fit(result, samples=None):
         'center_shift': center_shift,
         'flank_radius_excess': flank_radius_excess,
         'warnings': warnings,
+        'full_profile_checked': False,
+        'scope': 'nominal_depth_only',
     }
 
 
@@ -1087,16 +1088,21 @@ def recommended_bore(result):
 
 
 def chord_segments(radius, sweep, tolerance=0.01):
+    if not all(math.isfinite(v) for v in (radius, sweep, tolerance)):
+        raise ValueError('离散圆弧参数必须为有限数值')
+    if tolerance <= 0:
+        raise ValueError('离散公差必须大于零')
     if radius <= 0 or sweep <= 0:
         return 1
-    tol = max(tolerance, 1e-9)
+    tol = tolerance
     if tol >= radius:
         return 2
-    ratio = max(-1.0, min(1.0, 1.0 - tol / radius))
-    half = math.acos(ratio)
-    if half <= 1e-9:
-        return 2
-    return max(2, min(int(math.ceil(sweep / (2.0 * half))), 720))
+    # acos(1-tol/r) 在大半径/小公差时会因消去误差得到零。
+    # 同一弦高公式的稳定形式；不得用固定段数上限破坏用户要求的公差。
+    half = 2.0 * math.asin(math.sqrt(tol / radius / 2.0))
+    if half == 0.0:
+        raise ValueError('离散公差小于当前浮点精度可表达的范围')
+    return max(2, int(math.ceil(sweep / (2.0 * half))))
 
 
 # ---------------------------------------------------------------------------

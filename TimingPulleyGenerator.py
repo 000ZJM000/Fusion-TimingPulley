@@ -33,22 +33,23 @@
 当前实现范围
 ------------
 
-**HTD 系列（2M / 3M / 5M / 8M / 14M / 20M）已完整实现**，齿槽几何全部可调。
-GT / RPP / T / AT / MXL 等系列已在 ui 中列出规格与型号，几何求解器待补
-（见 README「扩展新齿形系列」）。
+GT 2GT / 3GT / 5GT：依原厂带齿尺寸与专利方法生成理论共轭轮槽，无加工间隙。
+HTD：历史名义尺寸模型，支持 2M / 3M / 5M / 8M / 14M / 20M 与自定义节距，
+不声明整套 ISO 齿廓符合性。RPP / T / AT / MXL 待实现。
 """
 
 import importlib
 import os
 import sys
 import traceback
+import time
 
 import adsk.core
 import adsk.fusion
 
 # 本插件的版本号。**每次修改代码后必须递增**，用于确认 Fusion 加载的确实是
 # 新版本（启动时会打印到文本命令窗口）。
-__version__ = '0.5.0'
+__version__ = '0.8.0'
 
 # ---------------------------------------------------------------------------
 # 热重载：每次启动都从磁盘重新加载本插件的全部模块
@@ -174,7 +175,7 @@ def _rerun_self():
 
 CMD_ID = 'TimingPulleyGenerator_Create'
 CMD_NAME = '同步带轮'
-CMD_TOOLTIP = '生成同步带轮草图（当前完整支持 HTD 2M/3M/5M/8M/14M/20M）'
+CMD_TOOLTIP = '生成同步带轮草图：GT 2/3/5 mm 理论共轭；HTD 名义尺寸参考'
 
 PANEL_IDS = ['SolidCreatePanel', 'SketchCreatePanel']
 WORKSPACE_ID = 'FusionSolidEnvironment'
@@ -500,6 +501,7 @@ def _on_execute(args):
         _ui.messageBox('当前文档不是零件文档。')
         return
 
+    execute_started = time.perf_counter()
     try:
         opts = _dialog.read()
 
@@ -532,6 +534,7 @@ def _on_execute(args):
             'draw_center_line': opts.get('draw_center_line', False),
             'labels': opts['labels'],
             'sampled_fallback': opts['sampled_fallback'],
+            'compact_gt': opts.get('compact_gt', True),
         }
 
         out = SK.build(component, res, build_opts)
@@ -539,7 +542,9 @@ def _on_execute(args):
         # 可选标注文字
         if opts['labels']:
             try:
-                SK.draw_labels(out['sketch'], SK.label_items(res, build_opts))
+                cx, cy = out['center']
+                SK.draw_labels(out['sketch'], SK.label_items(res, build_opts),
+                               cx=cx, cy=cy)
             except Exception:
                 pass
 
@@ -555,21 +560,28 @@ def _on_execute(args):
         except Exception:
             pass
 
+        elapsed = time.perf_counter() - execute_started
+        out.setdefault('timings', {})['command_seconds'] = elapsed
         msgs = list(out['messages'])
         if not out['ok']:
             msgs.append('未生成有效轮廓，请检查参数或草图曲线。')
         if msgs:
-            _ui.messageBox('生成完成，但有提示：\n\n' + '\n'.join(msgs))
+            _ui.messageBox('生成完成，但有提示：\n\n' + '\n'.join(msgs)
+                           + '\n\n生成用时 {0:.2f} 秒，实际写入 {1} 条轮廓曲线'
+                           .format(elapsed, out['arc_count']))
         else:
             _ui.messageBox(
                 '已生成同步带轮草图「{0}」\n\n'
                 '节圆 ⌀{1:.3f} mm ／ 外圆 ⌀{2:.3f} mm ／ 齿数 {3}\n'
-                '轮廓圆弧 {4} 段'.format(
+                '轮廓曲线 {4} 段\n生成用时 {5:.2f} 秒'.format(
                     out['sketch'].name, res.pitch_diameter,
-                    res.outer_diameter, res.teeth, out['arc_count']))
+                    res.outer_diameter, res.teeth, out['arc_count'],
+                    elapsed))
 
-        _log('生成完成: {0} 段圆弧, {1} 个轮廓'.format(
+        _log('生成完成: {0} 段曲线, {1} 个轮廓'.format(
             out['arc_count'], out['profile_count']))
+        if out.get('timings'):
+            _log('性能计时（秒）: {0}'.format(out['timings']))
 
     except Exception:
         tb = traceback.format_exc()

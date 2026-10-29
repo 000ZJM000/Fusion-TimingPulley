@@ -29,11 +29,13 @@ Fusion 内部长度单位是 **厘米**，而 geometry.py 全部使用 **毫米*
 """
 
 import math
+import time
 
 import adsk.core
 import adsk.fusion
 
 from . import geometry as G
+from . import gt as GT
 
 # Fusion 内部长度单位为厘米
 MM = 0.1
@@ -69,8 +71,7 @@ def delete_sketch(sketch):
     """安全删除草图。"""
     try:
         if sketch is not None and sketch.isValid:
-            sketch.deleteMe()
-            return True
+            return sketch.deleteMe() is not False
     except Exception:
         pass
     return False
@@ -88,28 +89,31 @@ def resolve_center_point(sketch, ent):
         return float(ent[0]), float(ent[1])
     try:
         pt_world = None
-        if hasattr(ent, 'worldGeometry'):
+        # SketchCircle/SketchArc.worldGeometry is a Circle3D/Arc3D, not
+        # Point3D. Prefer the actual center point, including assembly context.
+        if hasattr(ent, 'centerSketchPoint') and ent.centerSketchPoint:
+            center = ent.centerSketchPoint
+            pt_world = getattr(center, 'worldGeometry', None)
+            if pt_world is None:
+                pt_world = center.geometry
+        elif hasattr(ent, 'worldGeometry'):
             pt_world = ent.worldGeometry
         elif hasattr(ent, 'geometry'):
-            geom = ent.geometry
-            if hasattr(geom, 'center'):
-                pt_world = geom.center
-            else:
-                pt_world = geom
-        elif hasattr(ent, 'centerSketchPoint') and ent.centerSketchPoint:
-            pt_world = getattr(ent.centerSketchPoint, 'worldGeometry', ent.centerSketchPoint.geometry)
+            pt_world = ent.geometry
         elif hasattr(ent, 'center'):
             pt_world = ent.center
 
+        if hasattr(pt_world, 'center'):
+            pt_world = pt_world.center
         if pt_world is not None:
             if hasattr(sketch, 'modelToSketchSpace'):
                 pt_sk = sketch.modelToSketchSpace(pt_world)
                 return pt_sk.x * 10.0, pt_sk.y * 10.0
             else:
                 return getattr(pt_world, 'x', 0.0) * 10.0, getattr(pt_world, 'y', 0.0) * 10.0
-    except Exception:
-        pass
-    return 0.0, 0.0
+    except Exception as err:
+        raise ValueError('无法读取所选圆心点：{0}'.format(err))
+    raise ValueError('所选实体不包含可用的点或圆心')
 
 
 def _add_arc(sketch, arc, cx=0.0, cy=0.0):
@@ -129,23 +133,104 @@ def _add_line(sketch, line, cx=0.0, cy=0.0):
         _pt(line.end[0] + cx, line.end[1] + cy))
 
 
-def draw_profile(sketch, result, cx=0.0, cy=0.0):
+def draw_profile(sketch, result, cx=0.0, cy=0.0, created=None):
     """绘制轮齿完整廓形，返回图元数量。
 
-    使用 geometry.closed_chain()：标准 HTD 齿形每齿包含相切圆弧与直线。
+    使用 geometry.closed_chain() 获取已求解的 HTD 或 GT 曲线链。
     """
     chain = G.closed_chain(result)
     n = 0
     for ent in chain:
         if isinstance(ent, G.Arc):
-            _add_arc(sketch, ent, cx=cx, cy=cy)
+            curve = _add_arc(sketch, ent, cx=cx, cy=cy)
         elif isinstance(ent, G.Line):
-            _add_line(sketch, ent, cx=cx, cy=cy)
+            curve = _add_line(sketch, ent, cx=cx, cy=cy)
+        else:
+            raise TypeError('不支持的轮廓图元：{0}'.format(type(ent).__name__))
+        if created is not None:
+            created.append(curve)
         n += 1
     return n
 
 
-def draw_profile_sampled(sketch, result, tolerance=0.01, cx=0.0, cy=0.0):
+def draw_gt_compact(sketch, result, cx=0.0, cy=0.0, created=None):
+    """Write C2 analytic-branch approximations with single interior knots.
+
+    Keep genuine branch boundaries and the root vertex, not sampling corners.
+    """
+    splines = sketch.sketchCurves.sketchFixedSplines
+    nurbs_type = adsk.core.NurbsCurve3D
+    curves = GT.prepare_smooth_profile(result)
+    halves = [(curve.control, curve.knots) for curve in curves]
+    halves.extend(([(-x, y) for x, y in reversed(curve.control)],
+                   [1 - knot for knot in reversed(curve.knots)])
+                  for curve in reversed(curves))
+    outer_arcs = G.tip_arcs(result)
+    n = 0
+    for index in range(result.teeth):
+        angle = index * result.pitch_angle
+        for control, knots in halves:
+            points = [G._rot(point, angle) for point in control]
+            nurbs = nurbs_type.createNonRational(
+                [_pt(x + cx, y + cy) for x, y in points], 3, knots, False)
+            if nurbs is None:
+                raise RuntimeError('Fusion 未能创建连续曲线的 NURBS 定义')
+            curve = splines.addByNurbsCurve(nurbs)
+            if curve is None:
+                raise RuntimeError('Fusion 未能创建固定样条')
+            if created is not None:
+                created.append(curve)
+            n += 1
+        curve = _add_arc(sketch, outer_arcs[index], cx=cx, cy=cy)
+        if created is not None:
+            created.append(curve)
+        n += 1
+    return n
+
+
+def _begin_batch(component, sketch, is_existing):
+    """Defer existing sketches only at their timeline position (Autodesk rule)."""
+    before = sketch.isComputeDeferred
+    timeline, marker = None, None
+    can_defer = not is_existing
+    if is_existing and not before:
+        design = getattr(component, 'parentDesign', None)
+        timeline = getattr(design, 'timeline', None)
+        feature = getattr(sketch, 'timelineObject', None)
+        if timeline is not None and feature is not None:
+            marker = timeline.markerPosition
+            try:
+                can_defer = feature.rollTo(False) is True
+            except Exception:
+                timeline.markerPosition = marker
+                timeline, marker = None, None
+            if not can_defer and timeline is not None:
+                timeline.markerPosition = marker
+                timeline, marker = None, None
+        else:
+            timeline = None
+    try:
+        if can_defer and not before:
+            sketch.isComputeDeferred = True
+    except Exception:
+        if timeline is not None:
+            timeline.markerPosition = marker
+        raise
+    return before, timeline, marker, can_defer and not before
+
+
+def _end_batch(sketch, state):
+    before, timeline, marker, changed = state
+    try:
+        if changed:
+            sketch.isComputeDeferred = before
+    finally:
+        if timeline is not None:
+            timeline.markerPosition = marker
+
+
+def draw_profile_sampled(sketch, result, tolerance=0.01, cx=0.0, cy=0.0,
+                         created=None):
     """退化方案：把廓形离散成折线绘制。
 
     仅在精确圆弧绘制失败时使用（例如极端参数下圆弧无法闭合）。
@@ -162,19 +247,24 @@ def draw_profile_sampled(sketch, result, tolerance=0.01, cx=0.0, cy=0.0):
         cur = _pt(p[0] + cx, p[1] + cy)
         if prev is not None:
             ln = lines.addByTwoPoints(prev, cur)
+            if created is not None:
+                created.append(ln)
             if first is None:
                 first = ln
             n += 1
         prev = cur
     # 闭合
     if first is not None and prev is not None:
-        lines.addByTwoPoints(prev, first.startSketchPoint)
+        ln = lines.addByTwoPoints(prev, _pt(pts[0][0] + cx, pts[0][1] + cy))
+        if created is not None:
+            created.append(ln)
         n += 1
     return n
 
 
 def draw_construction_circles(sketch, result, pitch=True, root=True,
-                              outer=False, mouth=False, centerline=False, cx=0.0, cy=0.0):
+                              outer=False, mouth=False, centerline=False,
+                              cx=0.0, cy=0.0, created=None):
     """绘制构造圆与辅助构造线（节圆 / 齿根圆 / 外圆 / 槽口标称宽 / 对称中心线），返回草图曲线列表。
 
     构造线不参与轮廓，仅供标注与目视检查。
@@ -184,17 +274,20 @@ def draw_construction_circles(sketch, result, pitch=True, root=True,
     out = []
     origin = _pt(cx, cy)
 
+    def remember(curve):
+        if created is not None:
+            created.append(curve)
+        curve.isConstruction = True
+        return curve
+
     if pitch:
-        c = circles.addByCenterRadius(origin, result.pitch_radius * MM)
-        c.isConstruction = True
+        c = remember(circles.addByCenterRadius(origin, result.pitch_radius * MM))
         out.append(('节圆', c))
     if root:
-        c = circles.addByCenterRadius(origin, result.groove_lowest * MM)
-        c.isConstruction = True
+        c = remember(circles.addByCenterRadius(origin, result.groove_lowest * MM))
         out.append(('齿根圆', c))
     if outer:
-        c = circles.addByCenterRadius(origin, result.outer_radius * MM)
-        c.isConstruction = True
+        c = remember(circles.addByCenterRadius(origin, result.outer_radius * MM))
         out.append(('外圆', c))
     if mouth:
         p_flank_r = getattr(result, 'tip_flank_right', None)
@@ -205,8 +298,7 @@ def draw_construction_circles(sketch, result, pitch=True, root=True,
         if p_flank_r is not None and p_flank_l is not None:
             p_l = _pt(p_flank_l[0] + cx, p_flank_l[1] + cy)
             p_r = _pt(p_flank_r[0] + cx, p_flank_r[1] + cy)
-            m_line = lines.addByTwoPoints(p_l, p_r)
-            m_line.isConstruction = True
+            m_line = remember(lines.addByTwoPoints(p_l, p_r))
             out.append(('槽口标称宽构造线', m_line))
     if centerline:
         # 绘制主齿槽对称中心线（沿 Y 轴，穿过原点、槽底中心点与外圆）
@@ -214,10 +306,23 @@ def draw_construction_circles(sketch, result, pitch=True, root=True,
         y_high = result.outer_radius + 1.0
         p_low = _pt(cx, cy + y_low)
         p_high = _pt(cx, cy + y_high)
-        c_line = lines.addByTwoPoints(p_low, p_high)
-        c_line.isConstruction = True
+        c_line = remember(lines.addByTwoPoints(p_low, p_high))
         out.append(('齿槽对称中心线', c_line))
     return out
+
+
+def _remove_created(created):
+    """Remove only this operation's entities, in reverse creation order."""
+    failed = []
+    for curve in reversed(created):
+        try:
+            if getattr(curve, 'isValid', True) and curve.deleteMe() is False:
+                failed.append(curve)
+        except Exception:
+            failed.append(curve)
+    if failed:
+        raise RuntimeError('无法撤销本次添加的 {0} 个草图图元'.format(len(failed)))
+    del created[:]
 
 
 # ---------------------------------------------------------------------------
@@ -230,14 +335,19 @@ def draw_labels(sketch, items, cx=0.0, cy=0.0):
     items: [(文本, x_mm, y_mm, 字高_mm), ...]
 
     注意：``SketchTexts.createInput3`` 的第一个参数是表达式（纯文本用单引号括起），
-    第二个参数是字高数值 (float，单位 cm)。
+    第二个参数是字高 ValueInput（内部长度单位 cm）。
     """
     texts = sketch.sketchTexts
     made = 0
     for text, x, y, h in items:
         try:
             expr = "'{0}'".format(str(text).replace("'", "''"))
-            inp = texts.createInput3(expr, h * MM)
+            if hasattr(texts, 'createInput3'):
+                inp = texts.createInput3(expr, _val(h))
+            else:
+                # Before November 2025, createInput2 used a numeric cm height
+                # and accepted literal text without enclosing quotes.
+                inp = texts.createInput2(str(text), h * MM)
             inp.setAsMultiLine(
                 _pt(x + cx, y + cy),
                 _pt(x + cx + max(h * 6.0, 1.0), y + cy + h),
@@ -278,9 +388,18 @@ def build(component, result, opts):
                 'messages': [str], 'ok': bool, 'center': (float, float) }
     """
     messages = []
+    started = time.perf_counter()
+    timings = {}
+    if result is None or not result.ok:
+        raise ValueError('无效的齿形求解结果，未修改草图')
     name = opts.get('sketch_name') or '同步带轮'
 
     target_plane = opts.get('target_plane')
+    # Profile cannot be passed to Sketches.add; its parent sketch is usable.
+    if target_plane is not None and not hasattr(target_plane, 'sketchCurves'):
+        parent_sketch = getattr(target_plane, 'parentSketch', None)
+        if parent_sketch is not None:
+            target_plane = parent_sketch
     is_existing_sketch = (
         target_plane is not None and (
             isinstance(target_plane, adsk.fusion.Sketch) or
@@ -288,15 +407,14 @@ def build(component, result, opts):
         )
     )
 
+    existing = None
     if is_existing_sketch:
         sketch = target_plane
     else:
-        # 同名草图处理：默认保留已有草图，自动递增重命名；用户勾选覆盖时才删除
+        # Build the replacement first; keep the original until success.
         existing = find_sketch(component, name)
         if existing is not None:
-            if opts.get('replace', False):
-                delete_sketch(existing)
-            else:
+            if not opts.get('replace', False):
                 base_name = name
                 idx = 1
                 while find_sketch(component, '{0} ({1})'.format(base_name, idx)):
@@ -308,80 +426,88 @@ def build(component, result, opts):
         sketch = sketches.add(plane)
         sketch.name = name
 
-    # 计算圆心偏移 (cx, cy)
-    cx, cy = 0.0, 0.0
-    center_arg = opts.get('center')
-    if isinstance(center_arg, (tuple, list)) and len(center_arg) >= 2:
-        cx, cy = float(center_arg[0]), float(center_arg[1])
-    elif 'cx' in opts or 'cy' in opts:
-        cx = float(opts.get('cx', 0.0))
-        cy = float(opts.get('cy', 0.0))
-    elif opts.get('center_point') is not None:
-        cx, cy = resolve_center_point(sketch, opts['center_point'])
-
-    # 延后计算，批量添加曲线，显著提速
-    sketch.isComputeDeferred = True
+    created = []
     arc_count = 0
+    compact_used = False
+    smooth_requested = bool(getattr(result, 'half_profile_points', None)) and opts.get('compact_gt', True)
     try:
+        # 计算圆心偏移 (cx, cy)
+        cx, cy = 0.0, 0.0
+        center_arg = opts.get('center')
+        if isinstance(center_arg, (tuple, list)) and len(center_arg) >= 2:
+            cx, cy = float(center_arg[0]), float(center_arg[1])
+        elif 'cx' in opts or 'cy' in opts:
+            cx = float(opts.get('cx', 0.0))
+            cy = float(opts.get('cy', 0.0))
+        elif opts.get('center_point') is not None:
+            cx, cy = resolve_center_point(sketch, opts['center_point'])
+        if not (math.isfinite(cx) and math.isfinite(cy)):
+            raise ValueError('圆心坐标必须是有限数值')
+
+        batch = _begin_batch(component, sketch, is_existing_sketch)
+        draw_started = time.perf_counter()
         try:
-            arc_count = draw_profile(sketch, result, cx=cx, cy=cy)
-        except Exception as err:
-            messages.append('精确圆弧绘制失败：{0}'.format(err))
-            if opts.get('sampled_fallback', True):
-                arc_count = draw_profile_sampled(sketch, result, cx=cx, cy=cy)
+            try:
+                if smooth_requested:
+                    try:
+                        arc_count = draw_gt_compact(sketch, result, cx=cx, cy=cy, created=created)
+                        compact_used = True
+                    except Exception as err:
+                        _remove_created(created)
+                        raise RuntimeError('GT 连续曲线写入失败，已撤销本次生成：{0}'.format(err)) from err
+                else:
+                    arc_count = draw_profile(sketch, result, cx=cx, cy=cy, created=created)
+            except Exception as err:
+                if smooth_requested or not opts.get('sampled_fallback', True):
+                    raise
+                # Remove the incomplete exact chain before drawing fallback.
+                _remove_created(created)
+                messages.append('精确圆弧绘制失败：{0}'.format(err))
+                arc_count = draw_profile_sampled(
+                    sketch, result, cx=cx, cy=cy, created=created,
+                    tolerance=getattr(result, 'approximation_tolerance', 0.01))
                 messages.append('已改用折线近似（{0} 段）'.format(arc_count))
-            else:
-                raise
 
-        # 构造圆与辅助构造线
-        cons = draw_construction_circles(
-            sketch, result,
-            pitch=opts.get('draw_pitch_circle', True),
-            root=opts.get('draw_root_circle', True),
-            outer=opts.get('draw_outer_circle', False),
-            mouth=opts.get('draw_mouth_line', False),
-            centerline=opts.get('draw_center_line', False),
-            cx=cx, cy=cy)
+            cons = draw_construction_circles(
+                sketch, result,
+                pitch=opts.get('draw_pitch_circle', True),
+                root=opts.get('draw_root_circle', True),
+                outer=opts.get('draw_outer_circle', False),
+                mouth=opts.get('draw_mouth_line', False),
+                centerline=opts.get('draw_center_line', False),
+                cx=cx, cy=cy, created=created)
 
-        # 在延后计算块内一次性完成曲线固定约束（避免每次 isFixed 触发 Fusion 求解器重算卡顿 20s）
-        curves = getattr(sketch, 'sketchCurves', None)
-        if curves is not None:
-            arcs = getattr(curves, 'sketchArcs', None)
-            if arcs is not None:
-                for arc in arcs:
-                    try:
-                        arc.isFixed = True
-                    except Exception:
-                        pass
-            circles = getattr(curves, 'sketchCircles', None)
-            if circles is not None:
-                for circle in circles:
-                    try:
-                        circle.isFixed = True
-                    except Exception:
-                        pass
-            lines = getattr(curves, 'sketchLines', None)
-            if lines is not None:
-                for line in lines:
-                    try:
-                        line.isFixed = True
-                    except Exception:
-                        pass
-    finally:
-        # 只在全部图元与约束添加完毕后触发单次求解（耗时从 20s 骤降至 0.1s）
-        sketch.isComputeDeferred = False
+            # User geometry in an existing sketch must remain editable.
+            fixed_spline_type = getattr(adsk.fusion, 'SketchFixedSpline', ())
+            for curve in created:
+                if isinstance(curve, fixed_spline_type):
+                    continue
+                try:
+                    curve.isFixed = True
+                except Exception:
+                    pass
+        finally:
+            timings['draw_seconds'] = time.perf_counter() - draw_started
+            compute_started = time.perf_counter()
+            _end_batch(sketch, batch)
+            timings['compute_seconds'] = time.perf_counter() - compute_started
 
-    # 统计
-    profile_count = 0
-    try:
+        profile_started = time.perf_counter()
         profile_count = sketch.profiles.count
+        timings['profile_seconds'] = time.perf_counter() - profile_started
+        if profile_count == 0:
+            raise ValueError('未生成有效轮廓（Profile 数为 0），已撤销本次生成')
+        if existing is not None and opts.get('replace', False):
+            if not delete_sketch(existing):
+                raise RuntimeError('无法覆盖同名草图，已保留原草图')
     except Exception:
-        pass
+        if is_existing_sketch:
+            _remove_created(created)
+        else:
+            delete_sketch(sketch)
+        raise
 
-    if profile_count == 0:
-        messages.append('警告：未生成有效轮廓（Profile 数为 0），'
-                        '请检查参数或查看草图曲线')
-
+    timings['total_seconds'] = time.perf_counter() - started
     return {
         'ok': profile_count > 0,
         'sketch': sketch,
@@ -390,6 +516,9 @@ def build(component, result, opts):
         'messages': messages,
         'construction': cons,
         'center': (cx, cy),
+        'compact_used': compact_used,
+        'source_segment_count': len(G.closed_chain(result)),
+        'timings': timings,
     }
 
 

@@ -209,6 +209,20 @@ def _install_core():
         def addSelection(self, entity):
             self._selections.append(Selection(entity))
 
+    class NurbsCurve3D(object):
+        @staticmethod
+        def createNonRational(controlPoints, degree, knots, isPeriodic):
+            if (degree != 3 or isPeriodic or len(controlPoints) < 4 or
+                    len(knots) != len(controlPoints) + degree + 1 or
+                    any(a > b for a, b in zip(knots, knots[1:]))):
+                raise ValueError('Invalid non-rational NURBS definition')
+            curve = NurbsCurve3D()
+            curve.controlPoints = list(controlPoints)
+            curve.degree = degree
+            curve.knots = list(knots)
+            return curve
+
+    core.NurbsCurve3D = NurbsCurve3D
     core.Point3D = Point3D
     core.Vector3D = Vector3D
     core.ValueInput = ValueInput
@@ -446,6 +460,14 @@ def _install_fusion():
             SketchEntity.__init__(self)
             self.startSketchPoint = None
             self.endSketchPoint = None
+            self._collection = None
+            self.isValid = True
+
+        def deleteMe(self):
+            if self._collection is not None and self in self._collection:
+                self._collection.remove(self)
+            self.isValid = False
+            return True
 
     class SketchArc(SketchCurve):
         def __init__(self, p0, p1, p2):
@@ -470,6 +492,14 @@ def _install_fusion():
             self.startSketchPoint = SketchPoint(p0)
             self.endSketchPoint = SketchPoint(p1)
             self.length = _dist(p0, p1)
+
+    class SketchFixedSpline(SketchCurve):
+        def __init__(self, geometry):
+            SketchCurve.__init__(self)
+            self.geometry = geometry
+            self.isFixed = True
+            self.startSketchPoint = SketchPoint(geometry.controlPoints[0])
+            self.endSketchPoint = SketchPoint(geometry.controlPoints[-1])
 
     class _Coll(object):
         def __init__(self, items=None):
@@ -515,11 +545,13 @@ def _install_fusion():
             a = SketchArc(p0, p1, p2)
             if a.radius is None:
                 raise ValueError('三点共线，无法构造圆弧: %r %r %r' % (p0, p1, p2))
+            a._collection = self._s._arcs
             self._s._arcs.append(a)
             return a
 
         def addByCenterStartSweep(self, c, s, sweep):
             a = SketchArc(c, s, s)
+            a._collection = self._s._arcs
             self._s._arcs.append(a)
             return a
 
@@ -541,6 +573,7 @@ def _install_fusion():
             if r <= 0:
                 raise ValueError('圆半径必须为正，得到 %r' % r)
             cc = SketchCircle(c, r)
+            cc._collection = self._s._circles
             self._s._circles.append(cc)
             return cc
 
@@ -562,14 +595,26 @@ def _install_fusion():
             if _dist(p0, p1) < 1e-12:
                 raise ValueError('零长度直线: %r %r' % (p0, p1))
             ln = SketchLine(p0, p1)
+            ln._collection = self._s._lines
             self._s._lines.append(ln)
             return ln
+
+    class SketchFixedSplines(object):
+        def __init__(self, sketch):
+            self._s = sketch
+
+        def addByNurbsCurve(self, curve):
+            spline = SketchFixedSpline(curve)
+            spline._collection = self._s._splines
+            self._s._splines.append(spline)
+            return spline
 
     class _Curves(object):
         def __init__(self, sketch):
             self.sketchArcs = SketchArcs(sketch)
             self.sketchCircles = SketchCircles(sketch)
             self.sketchLines = SketchLines(sketch)
+            self.sketchFixedSplines = SketchFixedSplines(sketch)
 
     class SketchTextInput(object):
         def __init__(self, expr, height):
@@ -589,9 +634,9 @@ def _install_fusion():
             if not (expr.startswith("'") and expr.endswith("'")):
                 raise ValueError(
                     'SketchTexts.createInput3 的表达式必须用单引号括起：%r' % expr)
-            if not isinstance(height, (int, float)):
+            if not isinstance(height, _core.ValueInput):
                 raise TypeError(
-                    'SketchTexts.createInput3 的 height 必须为 float/int，得到：%r' % (type(height),))
+                    'SketchTexts.createInput3 的 height 必须为 ValueInput，得到：%r' % (type(height),))
             return SketchTextInput(expr, height)
 
         def add(self, inp):
@@ -626,7 +671,7 @@ def _install_fusion():
         @property
         def count(self):
             sk = self._s
-            total_curves = len(sk._arcs) + len(sk._lines)
+            total_curves = len(sk._arcs) + len(sk._lines) + len(sk._splines)
             if total_curves < 12:
                 return 0
             n = 1
@@ -644,6 +689,7 @@ def _install_fusion():
             self._arcs = []
             self._circles = []
             self._lines = []
+            self._splines = []
             self._texts = []
             self.isComputeDeferred = False
             self.sketchCurves = _Curves(self)
@@ -761,6 +807,7 @@ def _install_fusion():
     fusion.Component = Component
     fusion.Sketch = Sketch
     fusion.SketchPoint = SketchPoint
+    fusion.SketchFixedSpline = SketchFixedSpline
     fusion.SketchCurve = SketchCurve
     fusion.SketchArc = SketchArc
     fusion.SketchCircle = SketchCircle

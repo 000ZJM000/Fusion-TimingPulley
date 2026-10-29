@@ -638,21 +638,30 @@ def test_dialog():
     allitems[UI.ID_PITCH].value = 0.5
     dlg.update()
 
-    # --- 非法/未知系列应被拒绝 ---
-    p_bad = dlg.read()
-    p_bad['family'] = 'UNKNOWN_FAMILY'
-    res, err = dlg.solve(p_bad)
-    check('未知系列给出明确提示', res is None and '不支持' in err, str(err))
+    # --- 未实现系列应被拒绝 ---
+    fam_dd = allitems[UI.ID_PROFILE]
+    for it in fam_dd.listItems._l:
+        it.isSelected = it.name.startswith('RPP')
+    dlg.update()
+    res, err = dlg.solve()
+    check('未实现系列给出明确提示',
+          res is None and '未实现' in err, str(err))
+    print('  未实现系列提示: {0}'.format(err.splitlines()[0]))
+
+    # 切回 HTD
+    for it in fam_dd.listItems._l:
+        it.isSelected = it.name.startswith('HTD')
+    dlg.update()
 
     # --- 间隙极端值 ---
     allitems[UI.ID_CLEAR].value = 0.5          # 过小 -> 应拒绝
     dlg.update()
     res, err = dlg.solve()
     check('过小间隙被拒绝', res is None, '竟然可解')
-    allitems[UI.ID_CLEAR].value = 0.05
+    allitems[UI.ID_CLEAR].value = 0.01
     dlg.update()
     res, err = dlg.solve()
-    check('标准间隙可解', res is not None, err)
+    check('小额外间隙可解且不缩小圆角', res is not None, err)
 
     # --- 空草图名 ---
     allitems[UI.ID_SKETCH_NAME].value = '   '
